@@ -1,0 +1,105 @@
+name: Grok Relay
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      prompt:
+        description: "Prompt untuk Grok"
+        required: true
+        default: "Halo Grok"
+
+jobs:
+  run-grok:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Restore Grok session from secret
+        env:
+          GROK_SESSION_JSON: ${{ secrets.GROK_SESSION_JSON }}
+        run: |
+          if [ -n "$GROK_SESSION_JSON" ]; then
+            case "$GROK_SESSION_JSON" in
+              GZB64:*)
+                printf '%s' "${GROK_SESSION_JSON#GZB64:}" | base64 -d | gunzip > session_grok.json
+                echo "Session restored from secret (decompressed)."
+                ;;
+              *)
+                printf '%s' "$GROK_SESSION_JSON" > session_grok.json
+                echo "Session restored from secret."
+                ;;
+            esac
+          fi
+
+      - name: Install & Setup Official Cloudflare WARP SOCKS5 Tunnel
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          curl -fsSL -o /tmp/warp.deb https://pkg.cloudflareclient.com/pool/jammy/main/c/cloudflare-warp/cloudflare-warp_2024.11.309.0_amd64.deb || curl -fsSL -o /tmp/warp.deb https://pkg.cloudflareclient.com/pool/jammy/main/c/cloudflare-warp/cloudflare-warp_2024.6.497.0_amd64.deb || true
+          if [ -f /tmp/warp.deb ] && [ $(stat -c%s /tmp/warp.deb) -gt 1000000 ]; then
+            sudo dpkg -i /tmp/warp.deb || true
+          fi
+          sudo systemctl start warp-svc
+          sleep 1
+          warp-cli --accept-tos registration new || warp-cli --accept-tos register || true
+          warp-cli --accept-tos mode proxy || true
+          warp-cli --accept-tos proxy port 40000 || true
+          warp-cli --accept-tos connect || true
+          sleep 2
+          warp-cli --accept-tos status || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache Playwright Browser
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+
+      - name: Fast Setup Playwright & Dependencies
+        run: |
+          pip install --no-cache-dir playwright playwright-stealth requests
+          if [ ! -d ~/.cache/ms-playwright ] || [ -z "$(ls -A ~/.cache/ms-playwright 2>/dev/null)" ]; then
+            playwright install chromium
+          fi
+
+      - name: Run Grok Engine with Playwright
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GROK_KEEPALIVE: ${{ github.event_name == 'schedule' }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          PROMPT_VAL="${{ github.event.inputs.prompt }}"
+          if [ -z "$PROMPT_VAL" ]; then
+            PROMPT_VAL="Halo Grok, siapa kamu dan apa keahlianmu?"
+          fi
+          xvfb-run -a python -u grok_engine.py "$PROMPT_VAL"
+
+      - name: Save Grok session to secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f session_grok.json ]; then
+            BLOB="GZB64:$(gzip -c session_grok.json | base64 -w0)"
+            if [ "${#BLOB}" -le 49152 ]; then
+              printf '%s' "$BLOB" > session_grok_blob.txt
+              gh secret set GROK_SESSION_JSON --repo ciroxtreme/grktt < session_grok_blob.txt
+              echo "Full session saved to secret (compressed)."
+            else
+              python3 -c "import json; f=open('session_grok.json'); d=json.load(f); f.close(); open('session_grok_clean.json','w').write(json.dumps({'cookies': d.get('cookies', []), 'origins': []}))"
+              gh secret set GROK_SESSION_JSON --repo ciroxtreme/grktt < session_grok_clean.json
+              echo "WARN: compressed state still >48KB, fell back to cookies-only."
+            fi
+            rm -f session_grok.json session_grok_clean.json session_grok_blob.txt
+          fi
